@@ -9,6 +9,7 @@
 
 pub mod acp;
 pub mod api;
+pub mod api_agentos_auth;
 pub mod api_config;
 pub mod api_onboard;
 pub mod api_pairing;
@@ -1079,6 +1080,14 @@ pub async fn run_gateway(
         .route("/hooks/claude-code", post(api::handle_claude_code_hook))
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
+        .route(
+            "/api/agentos/oauth/openai-codex/start",
+            post(api_agentos_auth::handle_openai_codex_oauth_start),
+        )
+        .route(
+            "/api/agentos/oauth/openai-codex/status",
+            get(api_agentos_auth::handle_openai_codex_oauth_status),
+        )
         .route(
             "/api/config",
             patch(api_config::handle_patch).options(api_config::handle_options_config),
