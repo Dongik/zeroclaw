@@ -148,6 +148,8 @@ pub async fn handle_openai_codex_oauth_start(
     let config = state.config.lock().clone();
     let login_id_for_task = login_id.clone();
     let profile_for_task = profile.clone();
+    let reload_tx = state.reload_tx.clone();
+    let shutdown_tx = state.shutdown_tx.clone();
     tokio::spawn(async move {
         let client = reqwest::Client::new();
         let code = match openai_oauth::receive_loopback_code(&pkce.state, Duration::from_secs(180))
@@ -182,11 +184,18 @@ pub async fn handle_openai_codex_oauth_start(
             .store_openai_tokens(&profile_for_task, token_set, account_id, true)
             .await
         {
-            Ok(_) => update_login(
-                &login_id_for_task,
-                LoginStatus::Complete,
-                Some("OpenAI Codex authentication completed".to_string()),
-            ),
+            Ok(_) => {
+                update_login(
+                    &login_id_for_task,
+                    LoginStatus::Complete,
+                    Some("OpenAI Codex authentication completed".to_string()),
+                );
+                if let Some(reload_tx) = reload_tx {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    let _ = shutdown_tx.send(true);
+                    let _ = reload_tx.send(true);
+                }
+            }
             Err(err) => update_login(
                 &login_id_for_task,
                 LoginStatus::Error,
