@@ -895,6 +895,136 @@ fn parse_sse_turn(body: &str) -> anyhow::Result<ResponsesTurnResult> {
     })
 }
 
+fn apply_count_tokens(event: StreamEvent, count_tokens: bool) -> StreamEvent {
+    match event {
+        StreamEvent::TextDelta(chunk) if count_tokens && !chunk.delta.is_empty() => {
+            StreamEvent::TextDelta(StreamChunk::delta(chunk.delta).with_token_estimate())
+        }
+        event => event,
+    }
+}
+
+async fn send_responses_stream_event(
+    tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+    event: StreamEvent,
+    count_tokens: bool,
+) -> bool {
+    tx.send(Ok(apply_count_tokens(event, count_tokens)))
+        .await
+        .is_ok()
+}
+
+async fn flush_responses_stream_buffer(
+    buffer: &mut String,
+    state: &mut ResponsesStreamState,
+    tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+    count_tokens: bool,
+) -> bool {
+    while let Some(idx) = buffer.find("\n\n") {
+        let chunk = buffer[..idx].to_string();
+        buffer.drain(..idx + 2);
+        match process_sse_chunk(&chunk, state) {
+            Ok(events) => {
+                for event in events {
+                    if !send_responses_stream_event(tx, event, count_tokens).await {
+                        return false;
+                    }
+                }
+            }
+            Err(err) => {
+                let _ = tx.send(Err(StreamError::Provider(err.to_string()))).await;
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+async fn finish_responses_stream(
+    buffer: &mut String,
+    state: &mut ResponsesStreamState,
+    tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+    count_tokens: bool,
+) {
+    if !buffer.trim().is_empty() {
+        match process_sse_chunk(buffer, state) {
+            Ok(events) => {
+                for event in events {
+                    if !send_responses_stream_event(tx, event, count_tokens).await {
+                        return;
+                    }
+                }
+            }
+            Err(err) => {
+                let _ = tx.send(Err(StreamError::Provider(err.to_string()))).await;
+                return;
+            }
+        }
+    }
+
+    if !state.saw_text_delta
+        && let Some(text) = state.fallback_text.take().filter(|text| !text.is_empty())
+        && !send_responses_stream_event(
+            tx,
+            StreamEvent::TextDelta(StreamChunk::delta(text)),
+            count_tokens,
+        )
+        .await
+    {
+        return;
+    }
+
+    let _ = tx.send(Ok(StreamEvent::Final)).await;
+}
+
+async fn stream_responses_body(
+    response: reqwest::Response,
+    tx: tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+    count_tokens: bool,
+) {
+    let mut state = ResponsesStreamState::default();
+    let mut buffer = String::new();
+    let mut pending_utf8 = Vec::new();
+    let mut stream = response.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let bytes = match chunk {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                let _ = tx
+                    .send(Err(StreamError::Provider(format!(
+                        "error reading OpenAI Codex response stream: {err}"
+                    ))))
+                    .await;
+                return;
+            }
+        };
+
+        if let Err(err) = append_utf8_stream_chunk(&mut buffer, &mut pending_utf8, &bytes) {
+            let _ = tx.send(Err(StreamError::Provider(err.to_string()))).await;
+            return;
+        }
+
+        if !flush_responses_stream_buffer(&mut buffer, &mut state, &tx, count_tokens).await {
+            return;
+        }
+    }
+
+    if !pending_utf8.is_empty() {
+        let err = std::str::from_utf8(&pending_utf8)
+            .expect_err("pending bytes should be invalid UTF-8 at end of stream");
+        let _ = tx
+            .send(Err(StreamError::Provider(format!(
+                "OpenAI Codex response ended with incomplete UTF-8: {err}"
+            ))))
+            .await;
+        return;
+    }
+
+    finish_responses_stream(&mut buffer, &mut state, &tx, count_tokens).await;
+}
+
 fn ensure_nonempty_responses_turn(
     result: ResponsesTurnResult,
     empty_error: impl FnOnce() -> anyhow::Error,
@@ -1065,13 +1195,13 @@ async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<Re
 }
 
 impl OpenAiCodexProvider {
-    async fn send_responses_request(
+    async fn send_responses_request_builder(
         &self,
         input: Vec<Value>,
         instructions: String,
         tools: Option<Vec<ResponsesToolSpec>>,
         model: &str,
-    ) -> anyhow::Result<ResponsesTurnResult> {
+    ) -> anyhow::Result<reqwest::RequestBuilder> {
         let use_gateway_api_key_auth = self.custom_endpoint && self.gateway_api_key.is_some();
         let profile = match self
             .auth
@@ -1180,13 +1310,64 @@ impl OpenAiCodexProvider {
             }
         }
 
-        let response = request_builder.json(&request).send().await?;
+        Ok(request_builder.json(&request))
+    }
+
+    async fn send_responses_request(
+        &self,
+        input: Vec<Value>,
+        instructions: String,
+        tools: Option<Vec<ResponsesToolSpec>>,
+        model: &str,
+    ) -> anyhow::Result<ResponsesTurnResult> {
+        let response = self
+            .send_responses_request_builder(input, instructions, tools, model)
+            .await?
+            .send()
+            .await?;
 
         if !response.status().is_success() {
             return Err(super::api_error("OpenAI Codex", response).await);
         }
 
         decode_responses_body(response).await
+    }
+
+    async fn stream_responses_request(
+        &self,
+        input: Vec<Value>,
+        instructions: String,
+        tools: Option<Vec<ResponsesToolSpec>>,
+        model: &str,
+        tx: tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+        count_tokens: bool,
+    ) {
+        let response = match self
+            .send_responses_request_builder(input, instructions, tools, model)
+            .await
+        {
+            Ok(builder) => builder.send().await,
+            Err(err) => {
+                let _ = tx.send(Err(StreamError::Provider(err.to_string()))).await;
+                return;
+            }
+        };
+
+        let response = match response {
+            Ok(response) => response,
+            Err(err) => {
+                let _ = tx.send(Err(StreamError::Provider(err.to_string()))).await;
+                return;
+            }
+        };
+
+        if !response.status().is_success() {
+            let err = super::api_error("OpenAI Codex", response).await;
+            let _ = tx.send(Err(StreamError::Provider(err.to_string()))).await;
+            return;
+        }
+
+        stream_responses_body(response, tx, count_tokens).await;
     }
 }
 
@@ -1272,11 +1453,11 @@ impl Provider for OpenAiCodexProvider {
     }
 
     fn supports_streaming(&self) -> bool {
-        false
+        true
     }
 
     fn supports_streaming_tool_events(&self) -> bool {
-        false
+        true
     }
 
     fn stream_chat(
@@ -1309,40 +1490,16 @@ impl Provider for OpenAiCodexProvider {
                 };
 
             let (instructions, input) = build_responses_input(&prepared.messages);
-            let result = provider
-                .send_responses_request(
+            provider
+                .stream_responses_request(
                     input,
                     instructions,
                     convert_tools(tools.as_deref()),
                     &model,
+                    tx,
+                    count_tokens,
                 )
                 .await;
-
-            match result {
-                Ok(response) => {
-                    for tool_call in response.tool_calls {
-                        if tx.send(Ok(StreamEvent::ToolCall(tool_call))).await.is_err() {
-                            return;
-                        }
-                    }
-
-                    if let Some(text) = response.text.filter(|text| !text.is_empty()) {
-                        let chunk = if count_tokens {
-                            StreamChunk::delta(text).with_token_estimate()
-                        } else {
-                            StreamChunk::delta(text)
-                        };
-                        if tx.send(Ok(StreamEvent::TextDelta(chunk))).await.is_err() {
-                            return;
-                        }
-                    }
-
-                    let _ = tx.send(Ok(StreamEvent::Final)).await;
-                }
-                Err(err) => {
-                    let _ = tx.send(Err(StreamError::Provider(err.to_string()))).await;
-                }
-            }
         });
 
         stream::unfold(rx, |mut rx| async move {
@@ -1560,6 +1717,34 @@ data: [DONE]
             parse_sse_turn(payload).unwrap().text.as_deref(),
             Some("Hello world")
         );
+    }
+
+    #[tokio::test]
+    async fn live_sse_flush_emits_text_delta_before_completion() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut state = ResponsesStreamState::default();
+        let mut buffer =
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n".to_string();
+
+        assert!(flush_responses_stream_buffer(&mut buffer, &mut state, &tx, false).await);
+
+        match rx.recv().await.expect("delta should be emitted") {
+            Ok(StreamEvent::TextDelta(chunk)) => assert_eq!(chunk.delta, "Hello"),
+            other => panic!("unexpected stream event: {other:?}"),
+        }
+
+        buffer.push_str("data: {\"type\":\"response.output_text.delta\",\"delta\":\" world\"}\n\n");
+        buffer.push_str("data: {\"type\":\"response.completed\",\"response\":{\"output_text\":\"Hello world\"}}\n\n");
+        finish_responses_stream(&mut buffer, &mut state, &tx, false).await;
+
+        match rx.recv().await.expect("second delta should be emitted") {
+            Ok(StreamEvent::TextDelta(chunk)) => assert_eq!(chunk.delta, " world"),
+            other => panic!("unexpected stream event: {other:?}"),
+        }
+        match rx.recv().await.expect("final should be emitted") {
+            Ok(StreamEvent::Final) => {}
+            other => panic!("unexpected stream event: {other:?}"),
+        }
     }
 
     #[test]
@@ -1932,11 +2117,11 @@ data: [DONE]
     }
 
     #[test]
-    fn provider_does_not_advertise_streaming_until_live_sse_is_wired() {
+    fn provider_advertises_streaming_when_live_sse_is_wired() {
         let provider = OpenAiCodexProvider::new(&ProviderRuntimeOptions::default(), None)
             .expect("provider should initialize");
 
-        assert!(!provider.supports_streaming());
-        assert!(!provider.supports_streaming_tool_events());
+        assert!(provider.supports_streaming());
+        assert!(provider.supports_streaming_tool_events());
     }
 }
